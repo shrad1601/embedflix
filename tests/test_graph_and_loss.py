@@ -41,18 +41,64 @@ try:
 except SyntaxError as e:
     check("loss_function_changer.py parses", False, str(e))
 
-check("stale 'log-loss' baseline premise is gone",
-      "trained with log-loss" not in src)
-check("corrected premise mentions BPR is already the baseline",
-      "already trained with BPR" in src)
-check("single-edit-location constraint text present (mirrors model_swapper's fix)",
-      "CRITICAL EXECUTION CONSTRAINT" in src and "ONE find-and-replace edit" in src)
-check("instruction to edit inside FM.step() in place present",
-      "INSIDE FM.step()" in src)
-check("'bpr' removed from the LOSS_CHOICE menu (baseline already IS bpr)",
-      "LOSS_CHOICE: [bpr | softmax | focal | warp]" not in src)
-check("_decide_technique candidates no longer include a redundant 'bpr' option",
-      '("bpr", "Bayesian Personalised Ranking BPR loss")' not in src)
+# Phase 2 rewrote this specialist from an LLM free-form proposer into a closed
+# deterministic menu, so it is now safe to IMPORT and CALL offline: it makes no
+# Anthropic client and no network request at all.
+check("no Anthropic client is constructed at import time",
+      "from anthropic import Anthropic" not in src and "Anthropic(" not in src)
+check("makes zero LLM calls", "messages.create" not in src)
+
+import ast as _ast
+from specialists.loss_function_changer import (
+    CANDIDATES as LOSS_CANDIDATES, loss_function_changer, _build_baseline_py)
+
+check("loss menu is the two within-user candidates",
+      [c[0] for c in LOSS_CANDIDATES] == ["loss:bpr_per_user", "loss:drop_user_linear"],
+      str([c[0] for c in LOSS_CANDIDATES]))
+
+with open("../starter-kit/baseline_official.py") as f:
+    official = f.read()
+check("frozen official baseline is the pointwise log-loss version",
+      "g = ((sigmoid(z) - y) / B)" in official and "BPR" not in official)
+
+for label, _desc in LOSS_CANDIDATES:
+    out = _build_baseline_py(label, official)
+    try:
+        _ast.parse(out); ok = True
+    except SyntaxError as e:
+        ok = False; print("  syntax error:", e)
+    check(f"{label}: generated baseline.py parses", ok)
+    check(f"{label}: is a real change, not a no-op", out != official)
+
+bpr = _build_baseline_py("loss:bpr_per_user", official)
+check("bpr_per_user pairs WITHIN user (not globally across the batch)",
+      "_build_user_pairs" in bpr and "step_pairs" in bpr)
+check("bpr_per_user actually binds the train users run_fm unpacked",
+      "Xtr, ytr, utr = enc['train']" in bpr and "_build_user_pairs(utr, ytr)" in bpr)
+check("bpr_per_user's training loop uses pair batches, not row batches",
+      "m.step_pairs(" in bpr and "m.step(Xtr[idx[" not in bpr)
+
+drop = _build_baseline_py("loss:drop_user_linear", official)
+check("drop_user_linear excludes field 0 (user_id) from the linear term",
+      "self.W[X[:, 1:]].sum(1)" in drop)
+check("drop_user_linear leaves the interaction term untouched",
+      "inter = 0.5 * ((S ** 2).sum(1) - (E ** 2).sum((1, 2)))" in drop)
+
+# exercise the real function with mocked tools -- no client exists to mock
+mock = {"read_file": lambda kw: official}
+o = loss_function_changer({"tried_approaches": [], "current_scores": {"primary": 0.6015}}, mock)
+check("sets _deterministic_edit targeting baseline.py",
+      o["_deterministic_edit"]["file"] == "baseline.py")
+check("picks the first untried candidate", o["tried_approaches"] == ["loss:bpr_per_user"])
+check("whole-file replacement: old_code is the file as read",
+      o["_deterministic_edit"]["old_code"] == official)
+o2 = loss_function_changer({"tried_approaches": ["loss:bpr_per_user"],
+                            "current_scores": {"primary": 0.6031}}, mock)
+check("advances to loss:drop_user_linear", o2["tried_approaches"][-1] == "loss:drop_user_linear")
+check("falls back safely when baseline_official.py is unreadable",
+      loss_function_changer({"tried_approaches": []},
+          {"read_file": lambda kw: "ERROR: nope" if "official" in kw["file_path"] else official}
+      )["_deterministic_edit"]["new_code"] != "")
 
 # ---------------------------------------------------------------------------
 # supervisor.py -- static check that the stale hardcoded ban is gone
