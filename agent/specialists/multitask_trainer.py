@@ -74,6 +74,15 @@ REASONING: [2-3 sentences of ML reasoning for judge logs]
         messages=[{"role": "user", "content": prompt}]
     )
 
+
+    # Phase 0.7 token accounting: this specialist is FILTERED by graph.py's
+    # _extract_specialist_output key whitelist, so writing state["total_tokens"]
+    # here would be silently dropped. Report through "_tokens_used" instead --
+    # code_writer, the very next node, folds it into total_tokens and resets it.
+    _usage = getattr(response, "usage", None)
+    _tok = ((getattr(_usage, "input_tokens", 0) + getattr(_usage, "output_tokens", 0))
+            if _usage is not None else 0)
+
     text = response.content[0].text
     parsed = _parse_response(text)
 
@@ -82,7 +91,8 @@ REASONING: [2-3 sentences of ML reasoning for judge logs]
         "hypothesis": parsed["hypothesis"],
         "code_change_instruction": parsed["code_instruction"],
         "reasoning": parsed["reasoning"],
-        "tried_approaches": tried + [f"multitask:{parsed['multitask_choice']}"]
+        "tried_approaches": tried + [f"multitask:{parsed['multitask_choice']}"],
+        "_tokens_used": state.get("_tokens_used", 0) + _tok,
     }
 
 

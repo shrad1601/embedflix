@@ -85,6 +85,18 @@ REASONING: [one sentence summary for the run log]
         messages=[{"role": "user", "content": prompt}]
     )
 
+    # Phase 0.7 token accounting: experiment_judge is an UNFILTERED graph node
+    # (graph.py calls it directly, not through _extract_specialist_output's key
+    # whitelist), so it can add to state["total_tokens"] itself -- unlike the
+    # filtered specialists, which go through state["_tokens_used"] instead.
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        state["total_tokens"] = (
+            state.get("total_tokens", 0)
+            + getattr(usage, "input_tokens", 0)
+            + getattr(usage, "output_tokens", 0)
+        )
+
     text = response.content[0].text
     parsed = _parse_response(text)
 

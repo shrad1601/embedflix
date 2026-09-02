@@ -155,6 +155,19 @@ STRATEGY: [one sentence — overall strategy for this phase of the run]
         messages=[{"role": "user", "content": prompt}]
     )
 
+    # Phase 0.7 token accounting: supervisor is an UNFILTERED graph node
+    # (graph.py calls it directly, not through _extract_specialist_output's
+    # key whitelist), so it can add to state["total_tokens"] itself --
+    # unlike the filtered specialists, which have to go through
+    # state["_tokens_used"] instead (see graph.py / state.py / agent.py).
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        state["total_tokens"] = (
+            state.get("total_tokens", 0)
+            + getattr(usage, "input_tokens", 0)
+            + getattr(usage, "output_tokens", 0)
+        )
+
     text = response.content[0].text
     parsed = _parse_response(text)
 

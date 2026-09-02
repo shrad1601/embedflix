@@ -1,0 +1,115 @@
+{
+  "_comment": "Measured seed variance of the OFFICIAL baseline (starter-kit/baseline_official.py, pointwise log-loss FM, k=16 lr=0.001 bs=8192 patience=4). Produced by Phase 0.4. This is what agent/agent.py's two-stage accept gate is calibrated against: a single-seed delta smaller than a couple of std here is indistinguishable from noise. NOT the organizers' file -- starter-kit/baseline_scores.json is theirs and must not be overwritten.",
+  "model": "FM (official log-loss)",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "per_seed": {
+    "0": {
+      "valid": {
+        "GAUC": 0.6671,
+        "nDCG@5": 0.5358,
+        "primary": 0.6015
+      },
+      "test": {
+        "GAUC": 0.6621,
+        "nDCG@5": 0.5286,
+        "primary": 0.5953
+      }
+    },
+    "1": {
+      "valid": {
+        "GAUC": 0.6674,
+        "nDCG@5": 0.5361,
+        "primary": 0.6018
+      },
+      "test": {
+        "GAUC": 0.6609,
+        "nDCG@5": 0.5287,
+        "primary": 0.5948
+      }
+    },
+    "2": {
+      "valid": {
+        "GAUC": 0.6671,
+        "nDCG@5": 0.5351,
+        "primary": 0.6011
+      },
+      "test": {
+        "GAUC": 0.6613,
+        "nDCG@5": 0.5283,
+        "primary": 0.5948
+      }
+    },
+    "3": {
+      "valid": {
+        "GAUC": 0.6675,
+        "nDCG@5": 0.5355,
+        "primary": 0.6015
+      },
+      "test": {
+        "GAUC": 0.6612,
+        "nDCG@5": 0.5288,
+        "primary": 0.595
+      }
+    },
+    "4": {
+      "valid": {
+        "GAUC": 0.6679,
+        "nDCG@5": 0.5361,
+        "primary": 0.602
+      },
+      "test": {
+        "GAUC": 0.6596,
+        "nDCG@5": 0.5267,
+        "primary": 0.5931
+      }
+    }
+  },
+  "summary": {
+    "valid": {
+      "GAUC": {
+        "mean": 0.6674,
+        "std": 0.000332,
+        "min": 0.6671,
+        "max": 0.6679
+      },
+      "nDCG@5": {
+        "mean": 0.53572,
+        "std": 0.000427,
+        "min": 0.5351,
+        "max": 0.5361
+      },
+      "primary": {
+        "mean": 0.60158,
+        "std": 0.000342,
+        "min": 0.6011,
+        "max": 0.602
+      }
+    },
+    "test": {
+      "GAUC": {
+        "mean": 0.66102,
+        "std": 0.000909,
+        "min": 0.6596,
+        "max": 0.6621
+      },
+      "nDCG@5": {
+        "mean": 0.52822,
+        "std": 0.00087,
+        "min": 0.5267,
+        "max": 0.5288
+      },
+      "primary": {
+        "mean": 0.5946,
+        "std": 0.000863,
+        "min": 0.5931,
+        "max": 0.5953
+      }
+    }
+  }
+}

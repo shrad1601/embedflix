@@ -59,6 +59,10 @@ def _extract_specialist_output(result: dict) -> dict:
         "strategy", "verdict", "analysis", "learning", "next_priority",
         "_phase1_results", "_phase1_query", "_phase2_results", "_phase2_query",
         "_phase1_label", "_phase2_label", "_deterministic_edit",
+        # Phase 0.7: lets a filtered specialist report its own LLM token
+        # usage. code_writer (the node immediately downstream of every
+        # specialist) folds this into state["total_tokens"] and resets it.
+        "_tokens_used",
     ]
     return {k: result[k] for k in keys if k in result}
 

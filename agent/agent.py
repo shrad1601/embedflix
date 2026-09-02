@@ -28,11 +28,28 @@ N_CONVERGE = 5
 MAX_ITERATIONS = 50
 MAX_WALL_HOURS = 6
 
+# Superseded by score_analyst's two-stage accept gate (Phase 0.5): this was
+# 8x BELOW the measured 5-seed noise floor (std ~= 0.0008, starter-kit/
+# seed_variance.json), so a bare `primary > best + IMPROVE_THRESHOLD`
+# comparison accepted pure seed noise as "improvement". Left defined (no
+# other module references it) rather than deleted, as a marker of the old
+# threshold the two-stage gate replaced.
 IMPROVE_THRESHOLD = 0.0001
 
 # Files a specialist is never allowed to touch, enforced here as defense in
 # depth (mcp_server.edit_file has no allowlist of its own).
-PROTECTED_FILES = {"evaluate.py"}
+# baseline_official.py is the frozen, never-edited reference copy used by
+# tests/test_baseline_reproduces.py and Phase 0's seed-variance measurement --
+# an agent edit to it would silently invalidate that reference.
+PROTECTED_FILES = {"evaluate.py", "baseline_official.py"}
+
+
+def _is_protected(file_path: str) -> bool:
+    """Exact-string `in PROTECTED_FILES` is bypassable with './evaluate.py',
+    'starter-kit/evaluate.py', a trailing slash, etc. -- normalize to the
+    bare basename first so every equivalent spelling of a protected file is
+    caught the same way."""
+    return os.path.basename(os.path.normpath(file_path or "")) in PROTECTED_FILES
 
 # code_writer is the single highest-leverage place to spend a bigger model:
 # it is the ONLY specialist-adjacent step that still does free-form
@@ -106,6 +123,16 @@ def code_writer(state: AgentState, tools: dict) -> AgentState:
        OLD_CODE/NEW_CODE pair, retries with corrective feedback if it doesn't
        match verbatim or doesn't parse, and applies it via edit_file.
     """
+    # Phase 0.7 token accounting: a filtered specialist (routed through
+    # graph.py's _extract_specialist_output) cannot add to state["total_tokens"]
+    # directly -- the whitelist there only lets a few keys through. It sets
+    # state["_tokens_used"] instead (now whitelisted); code_writer, the very
+    # next node in the graph, folds that into the running total and resets it
+    # to 0 so a stale value can never leak into an iteration whose specialist
+    # made no LLM call at all (same stale-data class of bug _raw_scores had).
+    state["total_tokens"] = state.get("total_tokens", 0) + state.get("_tokens_used", 0)
+    state["_tokens_used"] = 0
+
     det = state.get("_deterministic_edit")
     # Clear unconditionally, whether used or not -- otherwise a stale value
     # from this iteration could leak into a later iteration whose specialist
@@ -116,7 +143,7 @@ def code_writer(state: AgentState, tools: dict) -> AgentState:
         file_path = det.get("file", "baseline.py")
         old_code = det.get("old_code", "")
         new_code = det.get("new_code", "")
-        if file_path in PROTECTED_FILES:
+        if _is_protected(file_path):
             state["error_message"] = (
                 f"code_writer: refused deterministic edit to protected file {file_path} "
                 "(evaluate.py must never be modified)"
@@ -171,7 +198,7 @@ def code_writer(state: AgentState, tools: dict) -> AgentState:
             )
             continue
 
-        if candidate["file"] in PROTECTED_FILES:
+        if _is_protected(candidate["file"]):
             state["total_tokens"] = state.get("total_tokens", 0) + tokens_used
             state["error_message"] = (
                 f"code_writer: refused edit to protected file {candidate['file']} "
@@ -458,6 +485,45 @@ def error_recovery(state: AgentState, tools: dict) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
+def _confirm_with_extra_seeds(tools: dict, seed0_primary: float, best_primary: float):
+    """Two-stage accept gate, stage 2 (Phase 0.5).
+
+    Seed 0's score already cleared the > 0.001 screen against best, but the
+    measured 5-seed std is ~0.0008 (starter-kit/seed_variance.json), so a
+    single seed's delta is not trustworthy on its own. Re-run seeds 1 and 2
+    for real, average all three, and accept only if the 3-seed mean beats
+    best by more than EPSILON/2 -- roughly a 1.25 sigma bar instead of a
+    single noisy sample.
+
+    Returns (accepted: bool, detail: dict) -- detail is attached to the
+    experiment_history entry for transparency. A confirmation run that fails
+    to produce a parseable score REJECTS rather than raising -- a flaky
+    subprocess must never be treated as a green light.
+    """
+    primaries = [seed0_primary]
+    detail = {"seed0_primary": seed0_primary}
+    for seed in (1, 2):
+        try:
+            output = tools["run_pipeline"]({"extra_args": f"--seed {seed}"})
+            parsed = tools["parse_scores"]({"pipeline_output": output})
+            p = parsed.get("primary")
+        except Exception as e:  # noqa: BLE001 -- confirmation runs must never crash the gate
+            p = None
+            detail[f"seed{seed}_error"] = f"{type(e).__name__}: {e}"
+        detail[f"seed{seed}_primary"] = p
+        if p is None:
+            detail["rejected_reason"] = f"confirmation run for seed {seed} produced no parseable score"
+            detail["accepted"] = False
+            return False, detail
+        primaries.append(p)
+
+    mean_primary = sum(primaries) / len(primaries)
+    detail["mean_primary"] = mean_primary
+    accepted = mean_primary > best_primary + (EPSILON / 2)
+    detail["accepted"] = accepted
+    return accepted, detail
+
+
 def score_analyst(state: AgentState, tools: dict) -> AgentState:
     """Reads scores, checks if improved, updates best, saves/restores
     checkpoint accordingly, refreshes current_code, and appends the flat
@@ -467,14 +533,40 @@ def score_analyst(state: AgentState, tools: dict) -> AgentState:
     Owns experiment_history and checkpointing outright -- experiment_judge.py
     (as pushed) still appends its own entry and checkpoints too, but per
     Person A's confirmation the rewritten reasoning-only version drops both,
-    so this stays the single source of truth for both."""
+    so this stays the single source of truth for both.
+
+    Phase 0.5/0.6: two-stage accept gate + no-op detector, replacing the bare
+    IMPROVE_THRESHOLD comparison (see its definition above for why that was
+    unsound). Training is seed-deterministic, so a dead edit (one that never
+    actually connects to training) returns a bit-identical score to best --
+    that is flagged explicitly as verdict=NO_OP rather than silently logged
+    as 'the technique was tried and it did not help', which is what the
+    edit-never-applied / edit-applied-but-inert cases used to look like."""
     scores = state["current_scores"]
     raw_scores = state.get("_raw_scores", {})
     best = state["best_scores"]
     iteration = state["iteration"] + 1
     state["iteration"] = iteration
 
-    improved = (scores.get("primary") or -1) > (best.get("primary") or -1) + IMPROVE_THRESHOLD
+    seed0_primary = scores.get("primary")
+    best_primary = best.get("primary")
+    best_primary = best_primary if best_primary is not None else -1
+
+    no_op = (
+        seed0_primary is not None
+        and best_primary != -1
+        and abs(seed0_primary - best_primary) < 1e-9
+    )
+
+    confirm_detail = None
+    if no_op:
+        improved = False
+    else:
+        delta = (seed0_primary if seed0_primary is not None else -1) - best_primary
+        if delta > 0.001:
+            improved, confirm_detail = _confirm_with_extra_seeds(tools, seed0_primary, best_primary)
+        else:
+            improved = False
 
     if improved:
         tools["save_checkpoint"]({"iteration": iteration, "primary_score": scores.get("primary", 0.0)})
@@ -486,11 +578,19 @@ def score_analyst(state: AgentState, tools: dict) -> AgentState:
         state["iterations_without_improvement"] = state.get("iterations_without_improvement", 0) + 1
 
     specialist = state.get("next_specialist", "unknown")
-    state["experiment_history"] = state.get("experiment_history", []) + [{
+    history_entry = {
         "iteration": iteration, "specialist": specialist, "hypothesis": state.get("hypothesis", ""),
         "gauc": scores.get("gauc"), "ndcg5": scores.get("ndcg5"), "primary": scores.get("primary"),
         "improved": improved,
-    }]
+    }
+    if no_op:
+        history_entry["no_op"] = True
+        history_entry["note"] = "the edit did not change model behaviour"
+        state["verdict"] = "NO_OP"
+    if confirm_detail is not None:
+        history_entry["confirm_seeds"] = confirm_detail
+
+    state["experiment_history"] = state.get("experiment_history", []) + [history_entry]
     state["tried_approaches"] = state.get("tried_approaches", [])  # specialists append their own label already
     # Refresh AFTER the accept/reject restore above, so this always reflects
     # what's actually on disk (the new code if accepted, the rolled-back

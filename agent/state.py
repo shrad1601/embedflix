@@ -121,6 +121,17 @@ class AgentState(TypedDict):
     # one -- same stale-data class of bug _raw_scores had.
     _deterministic_edit: Optional[Dict[str, str]]  # {file, old_code, new_code} or None
 
+    # Phase 0.7 token accounting: a FILTERED specialist (routed through
+    # graph.py's _extract_specialist_output, which whitelists keys) cannot
+    # write state["total_tokens"] directly -- only whitelisted keys survive
+    # the node boundary. It sets this instead (now whitelisted); code_writer,
+    # the very next node for every specialist, folds it into total_tokens and
+    # resets it to 0 -- same undeclared-field trap _raw_scores hit, so it
+    # must be declared here or Pregel silently drops it. Unfiltered nodes
+    # (supervisor.py, experiment_judge.py) add to total_tokens directly and
+    # don't need this field at all.
+    _tokens_used: int
+
 
 def initial_state() -> AgentState:
     import time
@@ -161,6 +172,7 @@ def initial_state() -> AgentState:
         _phase1_label="",
         _phase2_label="",
         _deterministic_edit=None,
+        _tokens_used=0,
     )
 
 

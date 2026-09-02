@@ -6,6 +6,7 @@ Run:      python mcp_server.py        (stdio, for Claude Desktop / Claude Code)
 Every tool is a plain Python function — FastMCP auto-generates the JSON schema
 from type annotations and docstrings, validates inputs, and handles transport.
 """
+import shlex
 import json
 import os
 import re
@@ -30,6 +31,23 @@ STARTER_KIT = os.path.join(_HERE, "../starter-kit")
 CHECKPOINTS = os.path.join(_HERE, "../checkpoints")
 LOG_PATH = os.path.join(_HERE, "../run_log.jsonl")
 RESOURCE_LOG = os.path.join(_HERE, "../resource_log.json")
+
+
+# Phase 0.8: path containment. read_file/edit_file used to do a bare
+# os.path.join(STARTER_KIT, file_path), which silently accepts "../.." and
+# absolute paths -- os.path.join("/a/b", "/etc/passwd") returns "/etc/passwd".
+# Resolve both sides and require the target to sit inside the starter kit.
+_STARTER_KIT_REAL = os.path.realpath(STARTER_KIT)
+
+
+def _safe_path(file_path: str):
+    """(real_path, None) if file_path stays inside the starter kit,
+    else (None, "ERROR: ..."). These tools return strings, never raise."""
+    candidate = os.path.realpath(os.path.join(_STARTER_KIT_REAL, file_path))
+    if candidate != _STARTER_KIT_REAL and not candidate.startswith(_STARTER_KIT_REAL + os.sep):
+        return None, (f"ERROR: refused path outside the starter-kit directory: "
+                      f"{file_path!r}. No changes made.")
+    return candidate, None
 # ── Tool 1: Run the FM pipeline ───────────────────────────────────────────────
 @mcp.tool
 def run_pipeline(
@@ -38,12 +56,14 @@ def run_pipeline(
     """
     Runs baseline.py --model fm in the starter-kit directory.
     Returns the combined stdout + stderr so the agent can parse scores
-    and errors. Timeout is 300 s (covers a full FM training run).
+    and errors. Timeout is 600 s (covers a full FM training run).
     """
-    cmd = f"python3 baseline.py --model fm {extra_args}".strip()
+    # List argv, not shell=True: extra_args is interpolated from agent state,
+    # so a shell string here is a command-injection surface for anything that
+    # can influence it. shlex.split gives the same token semantics safely.
+    cmd = ["python3", "baseline.py", "--model", "fm"] + shlex.split(extra_args or "")
     result = subprocess.run(
         cmd,
-        shell=True,
         capture_output=True,
         text=True,
         timeout=600,
@@ -60,7 +80,9 @@ def read_file(
     The agent uses this to inspect code before editing it — always read
     before you write.
     """
-    full_path = os.path.join(STARTER_KIT, file_path)
+    full_path, err = _safe_path(file_path)
+    if err:
+        return err
     try:
         with open(full_path) as f:
             return f.read()
@@ -78,7 +100,9 @@ def edit_file(
     Fails safely if the exact string is not found — no changes are written.
     Always call read_file first to confirm the string exists verbatim.
     """
-    full_path = os.path.join(STARTER_KIT, file_path)
+    full_path, err = _safe_path(file_path)
+    if err:
+        return err
     try:
         with open(full_path) as f:
             original_content = f.read()
@@ -199,15 +223,13 @@ def format_submission(
     Run this before any final submission to confirm the file passes all checks.
     """
     make = subprocess.run(
-        f"python3 submit.py --make --split {split} submission.csv",
-        shell=True,
+        ["python3", "submit.py", "--make", "--split", split, "submission.csv"],
         capture_output=True,
         text=True,
         cwd=STARTER_KIT,
     )
     check = subprocess.run(
-        f"python3 submit.py --check --split {split} submission.csv",
-        shell=True,
+        ["python3", "submit.py", "--check", "--split", split, "submission.csv"],
         capture_output=True,
         text=True,
         cwd=STARTER_KIT,
