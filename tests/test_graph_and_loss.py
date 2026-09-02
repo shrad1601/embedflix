@@ -20,6 +20,8 @@ def check(name, cond, detail=""):
 # matters here)
 # ---------------------------------------------------------------------------
 import graph
+from specialists.loss_function_changer import (
+    CANDIDATES as LOSS_CANDIDATES, _build_baseline_py)
 check("feature_engineer is in graph.SPECIALIST_FNS", "feature_engineer" in graph.SPECIALIST_FNS)
 check("feature_engineer is in graph.SPECIALISTS", "feature_engineer" in graph.SPECIALISTS)
 check("graph.SPECIALIST_FNS['feature_engineer'] is the real function",
@@ -44,17 +46,44 @@ except SyntaxError as e:
 # Phase 0 restored the shipped POINTWISE LOG-LOSS FM, so the prompt premise
 # flipped back: baseline is log-loss again, and BPR is a valid move onto it.
 check("premise says the baseline is pointwise log-loss (Phase 0 restored it)",
-      "POINTWISE LOG-LOSS" in src and "(sigmoid(z) - y) / B" in src)
+      "pointwise log-loss" in src.lower())
 check("premise no longer claims BPR is already the baseline",
       "already trained with BPR" not in src)
 check("within-user invariance insight is injected",
       "WITHIN_USER_INVARIANCE" in src)
-check("single-edit-location constraint text present (mirrors model_swapper's fix)",
-      "CRITICAL EXECUTION CONSTRAINT" in src and "ONE find-and-replace edit" in src)
-check("instruction to edit inside FM.step() in place present",
-      "INSIDE FM.step()" in src)
-check("'bpr' is back in the LOSS_CHOICE menu (baseline is log-loss again)",
-      "LOSS_CHOICE: [bpr | softmax | focal | warp]" in src)
+
+# The four checks below replace the previous prompt-guardrail assertions
+# ("CRITICAL EXECUTION CONSTRAINT", "INSIDE FM.step()", the LOSS_CHOICE menu).
+# Those guarded an LLM free-form path that no longer exists: per-user BPR has
+# to change run_fm's loop AND the FM class body at once, which a single
+# find-and-replace cannot express, so this specialist became a closed
+# deterministic menu shipping whole-file baseline.py replacements. The
+# guardrails are not weakened, they are unnecessary -- so assert the stronger
+# property directly instead.
+check("loss specialist makes no LLM call (deterministic menu)",
+      "messages.create" not in src and "Anthropic(" not in src)
+check("ships whole-file replacements via the _deterministic_edit fast path",
+      "_deterministic_edit" in src and "baseline_official.py" in src)
+check("menu is the two within-user candidates",
+      [c[0] for c in LOSS_CANDIDATES] == ["loss:bpr_per_user", "loss:drop_user_linear"],
+      str([c[0] for c in LOSS_CANDIDATES]))
+
+_official = open(os.path.join(_REPO, "starter-kit", "baseline_official.py")).read()
+for _lbl, _d in LOSS_CANDIDATES:
+    try:
+        _out = _build_baseline_py(_lbl, _official); ast.parse(_out)
+        check(f"{_lbl}: builds and parses against the frozen official baseline", True)
+    except Exception as _e:
+        check(f"{_lbl}: builds and parses against the frozen official baseline", False, str(_e))
+
+_bpr = _build_baseline_py("loss:bpr_per_user", _official)
+check("bpr_per_user pairs WITHIN user (precomputed index, not batch-global)",
+      "_build_user_pairs" in _bpr and "step_pairs" in _bpr)
+check("bpr_per_user passes the train users run_fm already unpacks",
+      "Xtr, ytr, utr = enc['train']" in _bpr)
+_drop = _build_baseline_py("loss:drop_user_linear", _official)
+check("drop_user_linear removes W[user_id] from the linear term",
+      "self.W[X[:, 1:]].sum(1)" in _drop)
 
 # ---------------------------------------------------------------------------
 # supervisor.py -- static check that the stale hardcoded ban is gone
