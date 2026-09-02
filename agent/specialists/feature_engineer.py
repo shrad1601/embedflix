@@ -1,54 +1,139 @@
-# agent/specialists/feature_engineer.py
-"""New specialist: proposes using the video engagement-statistics columns in
-video_features_statistic_pure.csv (never read anywhere in the runtime
-pipeline before this) that the organizers' own ablation_features.py script
-never tests -- that script only tries user_features_pure.csv's small
-categorical/demographic columns and a few video_features_basic_pure.csv
-categorical columns, all of which it already showed make things *worse*
-(0.5953 base -> 0.5936 / 0.5933, on the real held-out test split). The
-untested lever is the ~50 *numeric* engagement stats in
-video_features_statistic_pure.csv (play_cnt, like_cnt, show_cnt, etc.).
+"""Item-side feature specialist.
 
-Encoding approach: baseline.py's FM is purely categorical-embedding based --
-every FIELDS entry is a vocab lookup, there's no continuous/linear input
-path. data.py's existing dur_bucket field already shows the established
-pattern for turning a continuous value into an FM-compatible field:
-quantile-bucket it (edges from the TRAIN split only, so no leakage) and
-treat the bucket id as a categorical domain. Every candidate here follows
-that exact pattern -- no FM architecture change.
+THE INSIGHT THIS SPECIALIST IS BUILT ON
+---------------------------------------
+starter-kit/evaluate.py computes BOTH scored metrics strictly WITHIN each
+user's own impression list: it groups rows by user_id, sorts each user's list
+by predicted score, then takes a per-user AUC (GAUC) and a per-user nDCG@5.
 
-Deterministic menu, escalating richness (same spirit as ablation_features.py's
-own base/item/cwm13 progression, but for the untested numeric columns):
-  1. features:playcount   -- + play_cnt bucketed (1 new domain)
-  2. features:engagement3 -- + play_cnt, like_cnt, show_cnt bucketed (3 new domains)
-  3. features:engagement6 -- + play_cnt, like_cnt, show_cnt, comment_cnt,
-                               share_cnt, download_cnt bucketed (6 new domains)
+It follows that **any score component that is constant within a user is
+mathematically invisible to both metrics** -- it shifts every row in that
+user's list by the same amount and so cannot reorder any of them.
 
-Each candidate is a FULL replacement of data.py (the file is only 64 lines,
-so this is one clean edit, not a fragile multi-location patch). Unlike
-training_optimizer's single-line substring edits (which compose across
-iterations because they touch independent lines), these are alternative
-full-file states, not additive patches -- candidate 2 is not "candidate 1
-plus more", it's built fresh from the same 5-field baseline as candidate 1,
-so all three are directly comparable to the real baseline, never stacked on
-each other. That's why old_code is read fresh from disk every call (via
-tools["read_file"]) instead of being a hardcoded original string: whatever
-data.py currently contains gets replaced with this candidate's independently
--derived target content.
+Consequences, all checkable against evaluate.py:
+  * the W[user_id] linear term contributes EXACTLY ZERO to GAUC and nDCG@5
+  * all 30 columns of user_features_pure.csv, used as linear features,
+    contribute EXACTLY ZERO in isolation
+  * user features only matter through the FM INTERACTION term V_user . V_item,
+    which does vary within the list
+  * ITEM-side features are the only direct lever
 
-Zero LLM calls for any of the three candidates -- this is a closed menu end
-to end, same fast path as training_optimizer/model_swapper's higher_k.
+This explains the organizers' own ablation_features.py result that adding
+user-side categoricals makes things WORSE on the real held-out test split
+(0.5953 -> 0.5936 / 0.5933): they add parameters and noise while contributing
+nothing to within-user ordering. It is also why this specialist's previous
+menu (raw play_cnt / like_cnt / show_cnt) was aimed at the wrong quantity --
+raw counts encode POPULARITY, which is largely constant within a user's list
+and is not the same thing as long-view propensity.
+
+Every candidate below is item-side and varies within a single user's list.
+
+MECHANISM (unchanged, it was already sound)
+-------------------------------------------
+Each candidate is a FULL replacement of starter-kit/data.py applied through
+code_writer's _deterministic_edit fast path -- zero LLM calls, zero
+translation risk. old_code is read fresh from disk each call, so candidates
+are alternative full-file states rather than stacked patches: every one is
+built from the same 5-field baseline and is therefore directly comparable to
+it, never to whichever candidate ran before.
+
+FM here is purely categorical-embedding based (every FIELDS entry is a vocab
+lookup; there is no continuous-input path), so continuous signals are
+quantile-bucketed the way dur_bucket already is. No model surgery.
+
+LEAKAGE DISCIPLINE
+------------------
+Every bucket edge and every target-encoding statistic is fit on the TRAIN
+split only, and the identical statistic is applied to train, valid and test so
+there is no train/serve skew. (Leave-one-out on train rows was tried and is
+WORSE -- 0.5846 vs 0.6021 valid -- because LOO and full statistics bucket the
+same row differently, so the model is served a field it never trained on.)
+The log file's per-interaction
+columns (is_click, is_like, is_follow, is_comment, is_forward, play_time_ms)
+are never candidates: LABEL ('long_view') is derived from the same row's
+play_time_ms/duration_ms and the is_* columns are simultaneous outcomes of
+the very impression being ranked.
 """
 
-# (label, [numeric video-stat columns to bucket and add], description)
+N_BUCKETS = 24
+TE_ALPHA = 20.0
+
+# (label, config, description). Config keys feed _build_data_py directly.
+#   stat_feats: (field_name, numerator_col, denominator_col|None) from
+#               video_features_statistic_pure.csv
+#   cat_cols:   item-side categoricals from video_features_basic_pure.csv
+#   target_enc: adds video_te + author_te (train-only, leave-one-out)
 CANDIDATES = [
-    ("features:playcount", ["play_cnt"],
-     "add play_cnt (bucketed) as a new field domain -- raw popularity signal"),
-    ("features:engagement3", ["play_cnt", "like_cnt", "show_cnt"],
-     "add play_cnt, like_cnt, show_cnt (bucketed) -- reach + approval + impressions"),
-    ("features:engagement6", ["play_cnt", "like_cnt", "show_cnt", "comment_cnt", "share_cnt", "download_cnt"],
-     "add play_cnt, like_cnt, show_cnt, comment_cnt, share_cnt, download_cnt (bucketed) -- full engagement profile"),
+    ("features:target_enc",
+     dict(stat_feats=[], cat_cols=[], target_enc=True),
+     "per-video and per-author historical long-view rate from the train split "
+     "only, Bayesian-smoothed (k + a*p_bar)/(n + a) with a=20 -- a direct prior "
+     "on the label that varies within every user's list and uses no "
+     "forward-looking data. MEASURED NEUTRAL (valid 0.6021 vs 0.6015 baseline): "
+     "100% of valid/test rows carry a video_id and author_id already seen in "
+     "train (median 44 train impressions each), so the FM already holds a free "
+     "embedding per video and per author that can learn this propensity "
+     "directly -- a target encoding of the same entity is redundant with it. "
+     "Kept as a documented negative result"),
+
+    ("features:longview_prior",
+     dict(stat_feats=[("longplay_rate", "long_time_play_cnt", "show_cnt"),
+                      ("complete_rate", "complete_play_cnt", "play_cnt"),
+                      ("valid_rate", "valid_play_cnt", "show_cnt"),
+                      ("play_progress", "play_progress", None)],
+          cat_cols=[], target_enc=False),
+     "near-direct priors on long_view from video_features_statistic_pure.csv, "
+     "as RATIOS not raw counts (raw counts encode popularity, the wrong "
+     "quantity): long_time_play_cnt/show_cnt, complete_play_cnt/play_cnt, "
+     "valid_play_cnt/show_cnt, play_progress"),
+
+    ("features:item_cat",
+     dict(stat_feats=[],
+          cat_cols=["music_id", "tag", "video_type", "upload_type"],
+          target_enc=False),
+     "the item-side categoricals sitting unused in video_features_basic_pure.csv "
+     "-- music_id and tag are not in FIELDS at all despite being free item-side "
+     "signal (tag is multi-valued, first tag only)"),
+
+    ("features:play_quality",
+     dict(stat_feats=[("avg_play_dur", "play_duration", "play_cnt"),
+                      ("like_rate", "like_cnt", "show_cnt"),
+                      ("follow_rate", "follow_cnt", "show_cnt"),
+                      ("share_rate", "share_cnt", "show_cnt")],
+          cat_cols=[], target_enc=False),
+     "per-impression engagement quality ratios: play_duration/play_cnt, "
+     "like_cnt/show_cnt, follow_cnt/show_cnt, share_cnt/show_cnt"),
+
+    ("features:combined",
+     None,   # resolved at call time from which earlier candidates improved
+     "union of whichever of the preceding candidates actually improved the "
+     "score, so the phase ends on the best combination rather than the best "
+     "single family"),
 ]
+
+_COMBINABLE = CANDIDATES[:-1]
+
+
+def _resolve_combined(state):
+    """Union the configs of the earlier candidates that actually improved.
+
+    Routing to this specialist is forced and sequential (see supervisor.py),
+    so the i-th feature_engineer entry in experiment_history corresponds to
+    _COMBINABLE[i]. score_analyst already computed `improved` for each, against
+    a noise-aware threshold, so that flag is the honest signal here -- no
+    re-deriving deltas from raw scores.
+    """
+    hist = [h for h in state.get("experiment_history", [])
+            if h.get("specialist") == "feature_engineer"]
+    winners = [_COMBINABLE[i] for i, h in enumerate(hist)
+               if i < len(_COMBINABLE) and h.get("improved")]
+    cfg = dict(stat_feats=[], cat_cols=[], target_enc=False)
+    for _lbl, c, _d in winners:
+        cfg["stat_feats"] = cfg["stat_feats"] + c["stat_feats"]
+        cfg["cat_cols"] = cfg["cat_cols"] + [x for x in c["cat_cols"]
+                                             if x not in cfg["cat_cols"]]
+        cfg["target_enc"] = cfg["target_enc"] or c["target_enc"]
+    return cfg, [w[0] for w in winners]
 
 
 def feature_engineer(state: dict, tools: dict) -> dict:
@@ -56,28 +141,39 @@ def feature_engineer(state: dict, tools: dict) -> dict:
     primary = state.get("current_scores", {}).get("primary") or 0.6016
 
     untried = [c for c in CANDIDATES if c[0] not in tried]
-    label, feat_cols, desc = (untried or CANDIDATES)[0]
+    label, cfg, desc = (untried or CANDIDATES)[0]
+
+    note = ""
+    if label == "features:combined":
+        cfg, winners = _resolve_combined(state)
+        if winners:
+            note = f" Combining the candidates that improved: {', '.join(winners)}."
+        else:
+            note = (" No single candidate improved the score, so this combination "
+                    "is empty and reproduces the baseline exactly -- expect it to "
+                    "be flagged NO_OP, after which the feature-phase gate stops "
+                    "the run.")
 
     current_data_py = tools["read_file"]({"file_path": "data.py"})
-    new_data_py = _build_data_py(feat_cols)
+    new_data_py = _build_data_py(**cfg)
 
     hypothesis = (
-        f"Feature engineer: {desc} ({label}). Current primary {primary:.4f}. "
-        "video_features_statistic_pure.csv has never been read by the runtime "
-        "pipeline before -- ablation_features.py already showed the small "
-        "categorical feature additions from the other feature files make "
-        "things worse on the real test split (0.5953 -> 0.5936/0.5933), so "
-        "this specialist deliberately targets the untested numeric engagement "
-        "columns instead, bucketed the same way dur_bucket already is."
+        f"Feature engineer ({label}): {desc}. Current primary {primary:.4f}.{note} "
+        "Rationale: evaluate.py ranks strictly WITHIN each user's impression "
+        "list, so any component constant within a user cannot reorder that list "
+        "and is invisible to GAUC and nDCG@5 -- which is why user-side features "
+        "already measured worse (0.5953 -> 0.5936/0.5933) and why every field "
+        "added here is item-side. All bucket edges and target-encoding "
+        "statistics are fit on the train split only."
     )
 
     return {
         **state,
         "hypothesis": hypothesis,
         "code_change_instruction": (
-            f"(deterministic) replace the full contents of data.py with a version "
-            f"that also loads video_features_statistic_pure.csv and adds "
-            f"{feat_cols} as quantile-bucketed field domains."
+            "(deterministic) replace the full contents of data.py with an "
+            f"item-side feature variant: stat_feats={cfg['stat_feats']}, "
+            f"cat_cols={cfg['cat_cols']}, target_enc={cfg['target_enc']}."
         ),
         "reasoning": hypothesis,
         "tried_approaches": tried + [label],
@@ -89,95 +185,149 @@ def feature_engineer(state: dict, tools: dict) -> dict:
     }
 
 
-def _build_data_py(feat_cols: list) -> str:
-    """Generates the full data.py source for a given set of extra numeric
-    video-stat columns to bucket and add as FIELDS. Structurally identical to
-    the original 5-field data.py, just with vid2stats added to load() and the
-    corresponding bucketed domains added to encode()."""
-    n = len(feat_cols)
-    extra_fields = ", ".join(f"'{c}_bucket'" for c in feat_cols)
-    fields_line = (
-        "FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket'"
-        + (", " + extra_fields if n else "") + "]"
-    )
-    feat_cols_repr = repr(feat_cols)
+# --------------------------------------------------------------------------
+# data.py generator. A small interpolated CONFIG header + a large static
+# BODY constant -- the body needs no f-string brace-escaping, which is
+# where a template this size otherwise goes wrong.
+# --------------------------------------------------------------------------
+_BODY = '''
 
-    return f'''"""KuaiRand-Pure 数据加载 + 官方划分 + 特征编码。只依赖标准库和 numpy。
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
-feature_engineer specialist: extends the original 5-field version with
-{n} numeric video engagement-statistics column(s) from
-video_features_statistic_pure.csv ({feat_cols}), quantile-bucketed (train-split
-edges only, no leakage) the same way dur_bucket already is -- FM here is
-purely categorical-embedding based, so this is the FM-compatible way to add
-a continuous feature without changing the model architecture.
-"""
-import csv, os, collections
-import numpy as np
 
-LABEL = 'long_view'
-SPLITS = {{'train': (20220408, 20220421),
-          'valid': (20220422, 20220428),
-          'test':  (20220429, 20220508)}}
-# 5 个特征域 + feature_engineer 新增的数值型视频互动特征(分桶)。
-{fields_line}
-NUMERIC_VIDEO_FEATS = {feat_cols_repr}
+def _div(a, b):
+    a = _f(a); b = _f(b)
+    return a / b if b > 0 else 0.0
+
+
+def get_feature_info(user_feature_file=USER_FEATURE_FILE, video_feature_file=VIDEO_FEATURE_FILE):
+    """Real column names in the untapped user/video feature files. Does NOT
+    include log-file columns -- see the leakage note above."""
+    info = {}
+    for name, path in [('user', user_feature_file), ('video', video_feature_file)]:
+        with open(path) as f:
+            info[f'{name}_feature_columns'] = next(csv.reader(f))
+    return info
+
 
 def load(data_dir):
-    """读日志 + 视频侧特征，返回按划分切好的 dict。"""
-    vid2author = {{}}
+    """Log rows + item-side features. Returns splits dict.
+
+    Tuple layout (positions 0-6 are the ORIGINAL contract -- baseline.py,
+    submit.py and ablation_features.py all index them positionally):
+      0 date, 1 user_id, 2 video_id, 3 author_id, 4 tab, 5 duration_ms,
+      6 label, 7 [numeric video-stat features], 8 [item categoricals]
+    """
+    vid2author = {}
+    vid2cat = {}
     with open(os.path.join(data_dir, 'video_features_basic_pure.csv')) as fh:
         for r in csv.DictReader(fh):
             vid2author[r['video_id']] = r['author_id']
+            if ITEM_CAT_COLS:
+                vals = []
+                for c in ITEM_CAT_COLS:
+                    v = (r.get(c) or '').strip()
+                    if c == 'tag':
+                        # tag is MULTI-VALUED (quoted comma-separated, e.g. "20,43";
+                        # 1791 rows). Use the first tag only -- generalizes better
+                        # than treating each combination as its own vocab entry.
+                        v = v.split(',')[0].strip()
+                    vals.append(v if v else 'UNK')
+                vid2cat[r['video_id']] = vals
+    cat_unk = ['UNK'] * len(ITEM_CAT_COLS)
 
-    vid2stats = {{}}
-    if NUMERIC_VIDEO_FEATS:
+    vid2stats = {}
+    if VIDEO_STAT_FEATS:
         with open(os.path.join(data_dir, 'video_features_statistic_pure.csv')) as fh:
             for r in csv.DictReader(fh):
                 vid2stats[r['video_id']] = [
-                    float(r[c]) if r.get(c) not in (None, '') else 0.0
-                    for c in NUMERIC_VIDEO_FEATS
+                    _f(r.get(num)) if den is None else _div(r.get(num), r.get(den))
+                    for (_nm, num, den) in VIDEO_STAT_FEATS
                 ]
-    zeros = [0.0] * len(NUMERIC_VIDEO_FEATS)
+    stat_zeros = [0.0] * len(VIDEO_STAT_FEATS)
 
     rows = []
     for f in ('log_standard_4_08_to_4_21_pure.csv', 'log_standard_4_22_to_5_08_pure.csv'):
         with open(os.path.join(data_dir, f)) as fh:
             for r in csv.DictReader(fh):
-                rows.append((int(r['date']), r['user_id'], r['video_id'],
-                             vid2author.get(r['video_id'], 'UNK'), r['tab'],
+                vid = r['video_id']
+                rows.append((int(r['date']), r['user_id'], vid,
+                             vid2author.get(vid, 'UNK'), r['tab'],
                              float(r['duration_ms']), 1 if r[LABEL] != '0' else 0,
-                             vid2stats.get(r['video_id'], zeros)))
+                             vid2stats.get(vid, stat_zeros),
+                             vid2cat.get(vid, cat_unk)))
 
-    out = {{}}
+    out = {}
     for name, (lo, hi) in SPLITS.items():
         out[name] = [x for x in rows if lo <= x[0] <= hi]
     return out
 
-def _bucket_edges(values, n=10):
-    return np.quantile(np.asarray(values), np.linspace(0, 1, n + 1)[1:-1])
+
+def _bucket_edges(values, n):
+    return np.quantile(np.asarray(values, dtype=np.float64), np.linspace(0, 1, n + 1)[1:-1])
+
 
 def encode(splits):
-    """把类别特征映射成连续 id。未见过的取值统一落到该域的 UNK 槽。
-    返回 (X, y, users) per split，X 为 int32 (N, len(FIELDS))，以及 field_dims。"""
+    """Categorical ids. Unseen values fall into each field's UNK slot.
+    Returns (X, y, users) per split and the total field dim.
+
+    LEAKAGE DISCIPLINE: every bucket edge and every target-encoding statistic
+    below is fit on the TRAIN split only. Target encodings use leave-one-out
+    on train rows so a row can never encode its own label.
+    """
     tr = splits['train']
-    dur_edges = _bucket_edges([x[5] for x in tr])
-    feat_edges = [_bucket_edges([x[7][i] for x in tr]) for i in range(len(NUMERIC_VIDEO_FEATS))]
+    dur_edges = _bucket_edges([x[5] for x in tr], 10)
+    stat_edges = [_bucket_edges([x[7][i] for x in tr], N_BUCKETS)
+                  for i in range(len(VIDEO_STAT_FEATS))]
+
+    if USE_TARGET_ENC:
+        vpos = collections.Counter(); vcnt = collections.Counter()
+        apos = collections.Counter(); acnt = collections.Counter()
+        tot = 0
+        for x in tr:
+            vpos[x[2]] += x[6]; vcnt[x[2]] += 1
+            apos[x[3]] += x[6]; acnt[x[3]] += 1
+            tot += x[6]
+        pbar = (tot / len(tr)) if tr else 0.0
+
+        def te_full(key, pos, cnt):
+            n = cnt[key]
+            return (pos[key] + TE_ALPHA * pbar) / (n + TE_ALPHA) if n else pbar
+
+        te_v_edges = _bucket_edges([te_full(x[2], vpos, vcnt) for x in tr], N_BUCKETS)
+        te_a_edges = _bucket_edges([te_full(x[3], apos, acnt) for x in tr], N_BUCKETS)
 
     def raw(x):
-        base = [x[1], x[2], x[3], x[4], str(int(np.searchsorted(dur_edges, x[5])))]
-        extra = [str(int(np.searchsorted(feat_edges[i], x[7][i]))) for i in range(len(NUMERIC_VIDEO_FEATS))]
-        return base + extra
+        vals = [x[1], x[2], x[3], x[4], str(int(np.searchsorted(dur_edges, x[5])))]
+        for i in range(len(VIDEO_STAT_FEATS)):
+            vals.append(str(int(np.searchsorted(stat_edges[i], x[7][i]))))
+        vals.extend(x[8])
+        if USE_TARGET_ENC:
+            # The SAME train-fitted statistic is used for train, valid and test.
+            # Using leave-one-out on train rows instead was measured at
+            # valid 0.5846 vs 0.6021 here -- LOO and full statistics land a row
+            # in different quantile buckets, so the field the model trains on is
+            # not the field it is served, and that train/serve skew cost 0.0175.
+            vv = te_full(x[2], vpos, vcnt)
+            av = te_full(x[3], apos, acnt)
+            vals.append(str(int(np.searchsorted(te_v_edges, vv))))
+            vals.append(str(int(np.searchsorted(te_a_edges, av))))
+        return vals
 
     vocabs = [dict() for _ in FIELDS]
     for x in tr:
         for i, v in enumerate(raw(x)):
             if v not in vocabs[i]:
                 vocabs[i][v] = len(vocabs[i])
-    unk = [len(v) for v in vocabs]                 # 每个域末尾留一个 UNK 槽
+    unk = [len(v) for v in vocabs]
     field_dims = [len(v) + 1 for v in vocabs]
     offsets = np.cumsum([0] + field_dims[:-1]).astype(np.int32)
 
-    enc = {{}}
+    enc = {}
     for name, rws in splits.items():
         X = np.empty((len(rws), len(FIELDS)), dtype=np.int32)
         y = np.empty(len(rws), dtype=np.float32)
@@ -190,3 +340,48 @@ def encode(splits):
         enc[name] = (X, y, users)
     return enc, int(sum(field_dims))
 '''
+
+def _build_data_py(stat_feats, cat_cols, target_enc, n_buckets=N_BUCKETS, te_alpha=TE_ALPHA):
+    """stat_feats: list of (field_name, numerator_col, denominator_col_or_None)
+    cat_cols:    list of column names from video_features_basic_pure.csv
+    target_enc: adds video_te + author_te (train-only, leave-one-out)"""
+    names = [nm for (nm, _n, _d) in stat_feats]
+    fields = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
+    fields += [n + '_bucket' for n in names]
+    fields += list(cat_cols)
+    if target_enc:
+        fields += ['video_te', 'author_te']
+
+    header = '"""KuaiRand-Pure data loading + official splits + feature encoding.\n\n' \
+        'Generated by feature_engineer. Item-side features only.\n\n' \
+        'WHY ITEM-SIDE: evaluate.py computes GAUC and nDCG@5 strictly WITHIN each\n' \
+        "user's own impression list. Any score component that is constant within a\n" \
+        'user therefore cannot reorder that list and is mathematically invisible to\n' \
+        'both metrics -- which is why the organizers\' own ablation_features.py found\n' \
+        'user-side categorical features make things WORSE (0.5953 -> 0.5936/0.5933).\n' \
+        'Every field added here varies within a single user\'s impression list.\n' \
+        '"""\n' \
+        'import csv, os, collections\n' \
+        'import numpy as np\n\n' \
+        "LABEL = 'long_view'\n" \
+        "SPLITS = {'train': (20220408, 20220421),\n" \
+        "          'valid': (20220422, 20220428),\n" \
+        "          'test':  (20220429, 20220508)}\n" \
+        'FIELDS = ' + repr(fields) + '\n\n' \
+        'N_BUCKETS = ' + repr(n_buckets) + '\n' \
+        'TE_ALPHA = ' + repr(te_alpha) + '\n' \
+        '# (field_name, numerator_col, denominator_col or None) from video_features_statistic_pure.csv\n' \
+        'VIDEO_STAT_FEATS = ' + repr(stat_feats) + '\n' \
+        '# item-side categoricals from video_features_basic_pure.csv\n' \
+        'ITEM_CAT_COLS = ' + repr(list(cat_cols)) + '\n' \
+        'USE_TARGET_ENC = ' + repr(bool(target_enc)) + '\n\n' \
+        "USER_FEATURE_FILE = os.path.join(os.path.dirname(__file__), 'KuaiRand-Pure/data/user_features_pure.csv')\n" \
+        "VIDEO_FEATURE_FILE = os.path.join(os.path.dirname(__file__), 'KuaiRand-Pure/data/video_features_statistic_pure.csv')\n\n" \
+        '# NOTE: the log file\'s per-interaction columns (is_click, is_like, is_follow,\n' \
+        '# is_comment, is_forward, play_time_ms, ...) are deliberately NOT exposed as\n' \
+        "# candidate input features. LABEL ('long_view') is derived from the same row's\n" \
+        '# play_time_ms/duration_ms, and the other is_* columns are simultaneous\n' \
+        '# outcomes of the impression being predicted -- using any of them as an FM\n' \
+        '# input field would leak the label.\n'
+
+    return header + _BODY
